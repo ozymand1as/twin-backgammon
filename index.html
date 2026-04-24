@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>P2P Backgammon</title>
+    <link rel="manifest" href="manifest.json">
+    <style>
+        :root { --bg: #2d5a27; --p1: #e0c9a6; --p2: #5d3a1a; --white: #fff; --black: #222; }
+        body { margin: 0; font-family: sans-serif; background: #1a1a1a; color: white; overflow: hidden; touch-action: none; }
+        
+        /* Setup Screen */
+        #setup { display: flex; flex-direction: column; padding: 20px; gap: 10px; height: 100vh; justify-content: center; box-sizing: border-box; }
+        textarea { width: 100%; height: 80px; font-size: 10px; border-radius: 5px; }
+        button { padding: 15px; background: #4CAF50; border: none; color: white; font-weight: bold; border-radius: 5px; cursor: pointer; }
+        
+        /* Game Layout */
+        #game-container { display: none; height: 100vh; grid-template-rows: 1fr auto 1fr; background: var(--bg); }
+        .board-half { display: grid; grid-template-columns: repeat(6, 1fr); height: 100%; position: relative; }
+        .point { position: relative; height: 100%; display: flex; flex-direction: column; align-items: center; border: 1px solid rgba(0,0,0,0.05); }
+        
+        /* Triangles */
+        .point::before { content: ''; position: absolute; width: 0; height: 0; border-left: 7.5vw solid transparent; border-right: 7.5vw solid transparent; z-index: 1; }
+        .top .point::before { border-top: 40vh solid var(--p-color); top: 0; }
+        .bottom .point::before { border-bottom: 40vh solid var(--p-color); bottom: 0; }
+        .point:nth-child(odd) { --p-color: var(--p1); }
+        .point:nth-child(even) { --p-color: var(--p2); }
+        .drop-target { background: rgba(255,255,255,0.2) !important; }
+
+        /* Checkers */
+        .checker { width: 12vw; height: 12vw; border-radius: 50%; border: 2px solid #666; position: relative; z-index: 10; touch-action: none; transition: transform 0.1s; }
+        .white { background: var(--white); box-shadow: 0 4px #ccc; }
+        .black { background: var(--black); box-shadow: 0 4px #000; color: white; }
+        .dragging { opacity: 0.7; transform: scale(1.2); z-index: 1000 !important; pointer-events: none; }
+
+        /* Transfer Zone & Dice */
+        #mid-bar { height: 80px; background: #4a2b0f; display: flex; align-items: center; justify-content: space-between; padding: 0 10px; box-shadow: 0 0 20px rgba(0,0,0,0.5); z-index: 20; }
+        #transfer-zone { flex-grow: 1; height: 100%; border: 2px dashed rgba(255,255,255,0.3); display: flex; align-items: center; justify-content: center; font-size: 10px; }
+        
+        /* 3D Dice */
+        .dice-wrap { display: flex; gap: 15px; perspective: 400px; }
+        .dice { width: 30px; height: 30px; position: relative; transform-style: preserve-3d; transition: transform 0.8s; }
+        .face { position: absolute; width: 30px; height: 30px; background: white; border: 1px solid #333; color: black; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: bold; border-radius: 4px; }
+        .f1 { transform: rotateY(0deg) translateZ(15px); } .f6 { transform: rotateY(180deg) translateZ(15px); }
+        .f3 { transform: rotateY(90deg) translateZ(15px); } .f4 { transform: rotateY(-90deg) translateZ(15px); }
+        .f2 { transform: rotateX(90deg) translateZ(15px); } .f5 { transform: rotateX(-90deg) translateZ(15px); }
+        @keyframes roll { 0% { transform: rotateX(0) rotateY(0); } 100% { transform: rotateX(720deg) rotateY(720deg); } }
+        .rolling { animation: roll 0.4s infinite linear; }
+    </style>
+</head>
+<body>
+
+<div id="setup">
+    <h3>Backgammon P2P Setup</h3>
+    <select id="side">
+        <option value="right">Right Side (Points 1-12)</option>
+        <option value="left">Left Side (Points 13-24)</option>
+    </select>
+    <button onclick="initHost()">1. Host (Generate Offer)</button>
+    <textarea id="out-sdp" readonly placeholder="Send this code to friend..."></textarea>
+    <button onclick="initJoin()">2. Join (Paste Code Below)</button>
+    <textarea id="in-sdp" placeholder="Paste friend's code here..."></textarea>
+    <button style="background:#2196F3" onclick="finalize()">3. Connect</button>
+</div>
+
+<div id="game-container">
+    <div id="top-row" class="board-half top"></div>
+    <div id="mid-bar">
+        <div id="transfer-zone">TRANSFER TO OTHER HALF</div>
+        <div class="dice-wrap" onclick="rollDice()">
+            <div id="d1" class="dice"><div class="face f1">1</div><div class="face f6">6</div><div class="face f3">3</div><div class="face f4">4</div><div class="face f2">2</div><div class="face f5">5</div></div>
+            <div id="d2" class="dice"><div class="face f1">1</div><div class="face f6">6</div><div class="face f3">3</div><div class="face f4">4</div><div class="face f2">2</div><div class="face f5">5</div></div>
+        </div>
+    </div>
+    <div id="bottom-row" class="board-half bottom"></div>
+</div>
+
+<script>
+    let pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+    let dc, side, draggedElem, startIdx;
+    const rotations = { 1:{x:0,y:0}, 2:{x:-90,y:0}, 3:{x:0,y:-90}, 4:{x:0,y:90}, 5:{x:90,y:0}, 6:{x:180,y:0} };
+    let gameState = Array(24).fill(0);
+
+    // Initial Backgammon Setup
+    gameState[0]=2; gameState[11]=-5; gameState[16]=3; gameState[18]=5; // White
+    gameState[23]=-2; gameState[12]=-5; gameState[7]=-3; gameState[5]=5; // Black
+
+    function render() {
+        side = document.getElementById('side').value;
+        const top = document.getElementById('top-row'), bot = document.getElementById('bottom-row');
+        top.innerHTML = ''; bot.innerHTML = '';
+        const indices = side === 'right' ? [11,10,9,8,7,6, 0,1,2,3,4,5] : [12,13,14,15,16,17, 23,22,21,20,19,18];
+        indices.slice(0,6).forEach(i => top.appendChild(createPoint(i)));
+        indices.slice(6,12).forEach(i => bot.appendChild(createPoint(i)));
+    }
+
+    function createPoint(i) {
+        const p = document.createElement('div');
+        p.className = 'point'; p.dataset.idx = i;
+        const count = gameState[i];
+        for(let n=0; n < Math.abs(count); n++) {
+            const c = document.createElement('div');
+            c.className = `checker ${count > 0 ? 'white' : 'black'}`;
+            if(n === Math.abs(count)-1) c.onpointerdown = e => startDrag(e, i);
+            p.appendChild(c);
+        }
+        return p;
+    }
+
+    function startDrag(e, i) {
+        draggedElem = e.target; startIdx = i;
+        draggedElem.classList.add('dragging');
+        draggedElem.setPointerCapture(e.pointerId);
+    }
+
+    window.onpointermove = e => {
+        if(!draggedElem) return;
+        draggedElem.style.position = 'fixed';
+        draggedElem.style.left = (e.clientX - 25)+'px';
+        draggedElem.style.top = (e.clientY - 25)+'px';
+    };
+
+    window.onpointerup = e => {
+        if(!draggedElem) return;
+        draggedElem.classList.remove('dragging');
+        const target = document.elementFromPoint(e.clientX, e.clientY);
+        const point = target?.closest('.point');
+        const isTransfer = target?.id === 'transfer-zone';
+
+        if(point) move(startIdx, parseInt(point.dataset.idx));
+        else if(isTransfer) {
+            const to = prompt("Target point index (0-23)?");
+            if(to !== null) move(startIdx, parseInt(to));
+        }
+        draggedElem = null; render();
+    };
+
+    function move(from, to) {
+        const val = gameState[from];
+        if(val === 0) return;
+        gameState[from] > 0 ? gameState[from]-- : gameState[from]++;
+        gameState[to] += (val > 0 ? 1 : -1);
+        sync({ type: 'STATE', state: gameState });
+        render();
+    }
+
+    function rollDice() {
+        const d1 = Math.floor(Math.random()*6)+1, d2 = Math.floor(Math.random()*6)+1;
+        sync({ type: 'ROLL', v: [d1, d2] });
+        animDice(d1, d2);
+    }
+
+    function animDice(v1, v2) {
+        const d1 = document.getElementById('d1'), d2 = document.getElementById('d2');
+        d1.classList.add('rolling'); d2.classList.add('rolling');
+        setTimeout(() => {
+            d1.classList.remove('rolling'); d2.classList.remove('rolling');
+            d1.style.transform = `rotateX(${rotations[v1].x}deg) rotateY(${rotations[v1].y}deg)`;
+            d2.style.transform = `rotateX(${rotations[v2].x}deg) rotateY(${rotations[v2].y}deg)`;
+        }, 500);
+    }
+
+    function sync(data) { if(dc?.readyState === 'open') dc.send(JSON.stringify(data)); }
+
+    // WebRTC Logic
+    pc.onicecandidate = e => { if(!e.candidate) document.getElementById('out-sdp').value = JSON.stringify(pc.localDescription); };
+    pc.ondatachannel = e => { dc = e.channel; setupDC(); };
+
+    async function initHost() {
+        dc = pc.createDataChannel("game"); setupDC();
+        await pc.setLocalDescription(await pc.createOffer());
+    }
+    async function initJoin() { /* Just wait for paste */ }
+    async function finalize() {
+        const remote = JSON.parse(document.getElementById('in-sdp').value);
+        await pc.setRemoteDescription(new RTCSessionDescription(remote));
+        if(remote.type === 'offer') {
+            await pc.setLocalDescription(await pc.createAnswer());
+        }
+        document.getElementById('setup').style.display = 'none';
+        document.getElementById('game-container').style.display = 'grid';
+        render();
+    }
+    function setupDC() {
+        dc.onmessage = e => {
+            const msg = JSON.parse(e.data);
+            if(msg.type === 'STATE') { gameState = msg.state; render(); }
+            if(msg.type === 'ROLL') animDice(msg.v[0], msg.v[1]);
+        };
+    }
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
+</script>
+</body>
+</html>
